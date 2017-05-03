@@ -44,20 +44,15 @@ const WEB_URL = 'https://play.google.com/music/';
 const AUTH_URL = 'https://android.clients.google.com/auth';
 const MOBILE_URL = 'https://android.clients.google.com/music/';
 
-function request(token, options) {
+function request(token, options, parseResponse) {
   var opt = url.parse(options.url);
-  opt.headers = {
+  opt.headers = Object.assign({}, options.headers, {
     "Content-type": options.contentType || "application/x-www-form-urlencoded"
-  };
+  });
   if (token) {
     opt.headers.Authorization = "GoogleLogin auth=" + token
   }
   opt.method = options.method || "GET";
-  if(typeof options.options === "object") {
-    Object.keys(options.options).forEach(function(k) {
-      opt[k] = options.options[k];
-    });
-  }
 
   return new Promise((resolve, reject) => {
     var req = https.request(opt, function(res) {
@@ -74,17 +69,7 @@ function request(token, options) {
           return reject(err);
         }
 
-        var contentType = (typeof res.headers["content-type"] !== "string") ? null : res.headers["content-type"].split(";", 1)[0].toLowerCase();
-        var response = body;
-        try {
-          if(contentType === "application/json") {
-            response = JSON.parse(response);
-          }
-        } catch (e) {
-          reject(new Error("unable to parse json response: " + e), res)
-        }
-
-        resolve(response);
+        return (parseResponse ? parseResponse : defaultParseResponse)(res, body).then(resolve, reject).catch(reject);
       });
       res.on('error', function(error) {
         var err = new Error("Error making https request");
@@ -102,6 +87,26 @@ function request(token, options) {
   })
 };
 
+function defaultParseResponse(res, body) {
+  return new Promise((resolve, reject) => {
+    var contentType = null
+    if (typeof res.headers["content-type"] === "string") {
+      contentType = res.headers["content-type"].split(";", 1)[0].toLowerCase();
+    }
+
+    var response = body;
+    try {
+      if(contentType === "application/json") {
+        response = JSON.parse(response);
+      }
+    } catch (e) {
+      reject(new Error("unable to parse json response: " + e), res)
+    }
+
+    return resolve(response);
+  });
+}
+
 function login(email, password) {
   // load signing key
   var s1 = CryptoJS.enc.Base64.parse('VzeC4H4h+T2f0VI180nVX8x+Mb5HiTtGnKgH52Otj8ZCGDz9jRWyHb6QXK0JskSiOgzQfwTY5xgLLSdUSreaLVMsVVWfxfa8Rw==');
@@ -111,7 +116,8 @@ function login(email, password) {
       s1.words[idx] ^= s2.words[idx];
   }
 
-  const key = s1;
+  // todo: figure out better way to stringify key
+  const key = JSON.stringify(s1);
 
   return oauth(email, password).then(
     (data) => {
@@ -190,26 +196,25 @@ function oauth(email, password) {
  * @param callback function(err, settings) - success callback
  */
 function getSettings(token) {
-  return request(token, {
+  // loadsettings returns text/plain even though it's json, so we have to manually parse it.
+  function parseResponse(res, body) {
+    var response;
+    try {
+      response = JSON.parse(body);
+    } catch (e) {
+      throw new Error("error parsing settings: " + e)
+    }
+    return Promise.resolve(response)
+  }
+
+  var options = {
     method: "POST",
     url: WEB_URL + "services/fetchsettings?" + querystring.stringify({u: 0}),
     contentType: "application/json",
     data: JSON.stringify({"sessionId": ""})
-  }).then(
-    (body) => {
-      // loadsettings returns text/plain even though it's json, so we have to manually parse it.
-      var response;
-      try {
-        response = JSON.parse(body);
-      } catch (e) {
-        throw new Error("error parsing settings: " + e)
-      }
-      return response;
-    },
-    (err) => {
-      throw new Error("error loading settings: " + err);
-    }
-  )
+  }
+
+  return request(token, options, parseResponse);
 };
 
 /**
@@ -219,56 +224,64 @@ function getSettings(token) {
  * @param callback function(err, streamUrl) - success callback
  */
 function getStreamUrl(token, key, deviceId, id) {
-    if(!deviceId) {
-      return Promise.reject("Unable to find a usable device on your account, access from a mobile device and try again");
+  if(!deviceId) {
+    return Promise.reject("Unable to find a usable device on your account, access from a mobile device and try again");
+  }
+
+  // todo: figure out better way to stringify key
+  key = JSON.parse(key)
+
+  var salt = pmUtil.salt(13);
+  var sig = CryptoJS.HmacSHA1(id + salt, key).toString(pmUtil.Base64);
+  var qp = {
+    u: "0",
+    net: "wifi",
+    pt: "e",
+    targetkbps: "8310",
+    slt: salt,
+    sig: sig
+  };
+  if(id.charAt(0) === "T") {
+    qp.mjck = id;
+  } else {
+    qp.songid = id;
+  }
+
+  var qstring = querystring.stringify(qp);
+  var options = {
+    method: "GET",
+    url: MOBILE_URL + 'mplay?' + qstring,
+    headers: { "X-Device-ID": deviceId }
+  }
+
+  function parseResponse(res, body) {
+    if (res.statusCode === 302 && typeof res.headers.location === "string") {
+      return Promise.resolve(res.headers.location);
     }
+    return Promise.reject('Unable to get stream url')
+  }
 
-    var salt = pmUtil.salt(13);
-    var sig = CryptoJS.HmacSHA1(id + salt, key).toString(pmUtil.Base64);
-    var qp = {
-        u: "0",
-        net: "wifi",
-        pt: "e",
-        targetkbps: "8310",
-        slt: salt,
-        sig: sig
-    };
-    if(id.charAt(0) === "T") {
-        qp.mjck = id;
-    } else {
-        qp.songid = id;
-    }
-
-    var qstring = querystring.stringify(qp);
-    return request(token, {
-        method: "GET",
-        url: MOBILE_URL + 'mplay?' + qstring,
-        options: { headers: { "X-Device-ID": deviceId } }
-    }).then((data, res) => {
-      if (res.statusCode === 302 && typeof res.headers.location === "string") {
-        return res.headers.location;
-      }
-
-      throw new Error("Unable to get stream url" + err);
-    });
+  return request(token, options, parseResponse)
 };
 
 function getFavorites(token) {
-    this.request(token, {
-      method: "POST",
-      contentType: "application/json",
-      url: WEB_URL + 'services/getephemthumbsup'
-    }, function(err, body) {
-        if (err) {
-            return callback(err);
-        }
-        try {
-            body = JSON.parse(body);
-        } catch (err) {
-            return callback(err);
-        };
-        callback(null, body);
-    });
+  return request(token, {
+    method: "POST",
+    contentType: "application/json",
+    url: WEB_URL + 'services/getephemthumbsup'
+  }).then(
+    (body) => {
+      try {
+        body = JSON.parse(body);
+      } catch (err) {
+        throw err;
+      };
+      return body.track;
+    },
+    (err) => {
+      throw err
+    }
+  );
 };
 
 module.exports = {
