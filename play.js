@@ -284,8 +284,27 @@ function getFavorites(token) {
   );
 };
 
+function search(token, query, maxResults) {
+    var qp = {
+        q: query,
+        ct: '1,2,3,4,5,6,7,8,9',
+        "max-results": maxResults || 20
+    };
+    var qstring = querystring.stringify(qp);
+    return request(token, {
+        method: "GET",
+        url: BASE_URL + 'query?' + qstring
+    }).then(
+      (data) => data,
+      (err) => {
+        throw new Error("error getting search results: " + err)
+      }
+    );
+};
+
 module.exports = {
   login: login,
   getFavorites, getFavorites,
-  getStreamUrl: getStreamUrl
+  getStreamUrl: getStreamUrl,
+  search: search
 }
